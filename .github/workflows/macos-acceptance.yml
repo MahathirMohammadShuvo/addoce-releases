@@ -3,6 +3,70 @@ on:
   workflow_dispatch:
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      VERSION: v1.0.0
     steps:
-      - run: echo hello
+      - name: runner-info
+        run: |
+          echo "=== ADDOCE-TEST-START ==="
+          uname -a
+          sw_vers
+          echo "Arch: $(uname -m)"
+      - name: install-minisign
+        run: brew install minisign
+      - name: verify-release-happy-path
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/addoce-verify
+          cd /tmp/addoce-verify
+          curl -fLO "https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${VERSION}/verify-release.sh"
+          bash verify-release.sh "${VERSION}" --skip-docker
+      - name: negative-test-tampered-archive
+        run: |
+          set -euo pipefail
+          ver_num="${VERSION#v}"
+          arch=$(uname -m)
+          case "$arch" in
+            arm64) goarch=arm64 ;;
+            x86_64) goarch=amd64 ;;
+            *) echo "unsupported arch $arch" >&2; exit 1 ;;
+          esac
+          base="https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${VERSION}"
+          archive="addoce-node-${ver_num}-darwin-${goarch}.tar.gz"
+          mkdir -p /tmp/neg1 && cd /tmp/neg1
+          curl -fLOsS "${base}/${archive}"
+          curl -fLOsS "${base}/SHA256SUMS"
+          cp "$archive" tampered.tar.gz
+          printf '\x42' | dd of=tampered.tar.gz bs=1 seek=1000 count=1 conv=notrunc status=none
+          expected=$(grep -F "$archive" SHA256SUMS | awk '{print $1}')
+          actual=$(shasum -a 256 tampered.tar.gz | awk '{print $1}')
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          if [ "$expected" = "$actual" ]; then
+            echo "FAIL: tampered archive matched expected hash" >&2
+            exit 1
+          fi
+          echo "PASS: tampered archive hash differs from expected"
+      - name: negative-test-tampered-shasums
+        run: |
+          set -euo pipefail
+          base="https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${VERSION}"
+          mkdir -p /tmp/neg2 && cd /tmp/neg2
+          curl -fLOsS "${base}/SHA256SUMS"
+          curl -fLOsS "${base}/SHA256SUMS.minisig"
+          curl -fLOsS "${base}/addoce-pub.key"
+          minisign -V -p addoce-pub.key -m SHA256SUMS
+          echo "corrupt" >> SHA256SUMS
+          set +e
+          minisign -V -p addoce-pub.key -m SHA256SUMS
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "FAIL: minisign accepted tampered SHA256SUMS" >&2
+            exit 1
+          fi
+          echo "PASS: minisign rejected tampered SHA256SUMS (exit $rc)"
+      - name: final-marker
+        run: echo "=== ADDOCE-TEST-PASS: addoce-node ${VERSION} darwin-$(uname -m) fully verified ==="
