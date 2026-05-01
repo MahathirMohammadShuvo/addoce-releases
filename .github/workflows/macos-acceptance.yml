@@ -7,7 +7,7 @@ name: macOS acceptance test
 # Public repo → free macOS minutes; workflow_dispatch only.
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 jobs:
   verify:
