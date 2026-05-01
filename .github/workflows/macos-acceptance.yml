@@ -1,0 +1,100 @@
+name: macOS acceptance test
+
+# Phase-1 exit-gate test for the macOS arm64 leg.
+# - GCE has no macOS instances and AWS Mac has a 24h minimum lease, so we
+#   exercise the documented institutional verifier flow on GitHub-Actions
+#   `macos-latest` runners (Apple Silicon as of 2026).
+# - Public repo → free macOS minutes; safe to trigger.
+# - workflow_dispatch only — runs only when manually triggered.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "addoce-node release tag to verify (e.g. v1.0.0)"
+        required: true
+        default: "v1.0.0"
+
+jobs:
+  verify:
+    name: Verify ${{ inputs.version }} on macos-latest
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Show runner info
+        run: |
+          echo "=== ADDOCE-TEST-START ==="
+          uname -a
+          sw_vers
+          echo "Arch: $(uname -m)"
+
+      - name: Install minisign
+        run: brew install minisign
+
+      - name: Run documented verifier (happy path + cosign skipped)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/addoce-verify
+          cd /tmp/addoce-verify
+          curl -fLO "https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${{ inputs.version }}/verify-release.sh"
+          bash verify-release.sh "${{ inputs.version }}" --skip-docker
+
+      # The verifier above already extracts the archive into the workdir
+      # and runs --version. The negative tests below mirror the linux/Docker
+      # and windows/GCE legs exactly so the macOS audit trail looks the same.
+
+      - name: Negative test 1 — tampered archive must fail sha256
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          ver_num="${ver#v}"
+          arch=$(uname -m)
+          case "$arch" in
+            arm64) goarch=arm64 ;;
+            x86_64) goarch=amd64 ;;
+            *) echo "unsupported arch $arch" >&2; exit 1 ;;
+          esac
+          base="https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${ver}"
+          archive="addoce-node-${ver_num}-darwin-${goarch}.tar.gz"
+          mkdir -p /tmp/neg1 && cd /tmp/neg1
+          curl -fLOsS "${base}/${archive}"
+          curl -fLOsS "${base}/SHA256SUMS"
+          # Flip one byte at offset 1000.
+          dd if="$archive" of=tampered.tar.gz bs=1 count=1000 status=none
+          printf '\x42' >> tampered.tar.gz
+          dd if="$archive" of=tampered.tar.gz bs=1 skip=1001 seek=1001 status=none conv=notrunc
+          expected=$(grep -F "$archive" SHA256SUMS | awk '{print $1}')
+          actual=$(shasum -a 256 tampered.tar.gz | awk '{print $1}')
+          echo "expected: $expected"
+          echo "actual:   $actual"
+          if [ "$expected" = "$actual" ]; then
+            echo "FAIL: tampered archive matched expected hash" >&2
+            exit 1
+          fi
+          echo "PASS: tampered archive hash differs from expected"
+
+      - name: Negative test 2 — tampered SHA256SUMS must fail minisign
+        run: |
+          set -euo pipefail
+          ver="${{ inputs.version }}"
+          base="https://github.com/MahathirMohammadShuvo/addoce-releases/releases/download/${ver}"
+          mkdir -p /tmp/neg2 && cd /tmp/neg2
+          curl -fLOsS "${base}/SHA256SUMS"
+          curl -fLOsS "${base}/SHA256SUMS.minisig"
+          curl -fLOsS "${base}/addoce-pub.key"
+          # First confirm the unmodified file verifies (sanity).
+          minisign -V -p addoce-pub.key -m SHA256SUMS
+          # Tamper.
+          echo "corrupt" >> SHA256SUMS
+          set +e
+          minisign -V -p addoce-pub.key -m SHA256SUMS
+          rc=$?
+          set -e
+          if [ $rc -eq 0 ]; then
+            echo "FAIL: minisign accepted tampered SHA256SUMS" >&2
+            exit 1
+          fi
+          echo "PASS: minisign rejected tampered SHA256SUMS (exit $rc)"
+
+      - name: Final marker
+        run: echo "=== ADDOCE-TEST-PASS: addoce-node ${{ inputs.version }} darwin-$(uname -m) fully verified ==="
