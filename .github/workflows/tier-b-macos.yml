@@ -1,0 +1,165 @@
+name: Tier B macOS acceptance
+
+# Phase 5 macOS install acceptance test. Runs on macos-latest (arm64),
+# downloads a pre-built setup bundle from a localtunnel URL exposed by
+# the operator's laptop, runs install-darwin.sh, starts addoce-node,
+# triggers a storage 503 by curl-ing /api/v1/storage/status, and asserts
+# the [PRIVATE-NODE:storage] error: 503 auth log line is emitted. The
+# storage 503 line is also reported back to the operator's laptop via
+# MONITORING_INGEST_URL through the same tunnel — verification of the
+# arrival in /monitoring is done by the operator after the run.
+#
+# Trigger: workflow_dispatch with `tunnel_url` pointing at the running
+# proxy. The tunnel exposes only POST /api/v1/error-reports/* and GET
+# /bundle.tar.gz; everything else 404s.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tunnel_url:
+        description: "Public tunnel URL (https://*.loca.lt) — proxy must be running on operator's laptop"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  install-and-trigger:
+    name: install bundle + storage 503 round-trip
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - name: Print runner facts
+        run: |
+          uname -a
+          sw_vers
+          arch
+
+      - name: Download Phase 5 setup bundle
+        env:
+          TUNNEL_URL: ${{ inputs.tunnel_url }}
+        run: |
+          set -euo pipefail
+          echo "downloading bundle from $TUNNEL_URL/bundle.tar.gz"
+          curl -fsSL \
+            -H "User-Agent: tier-b-mac-runner/1.0" \
+            -H "bypass-tunnel-reminder: 1" \
+            -o bundle.tar.gz \
+            "$TUNNEL_URL/bundle.tar.gz"
+          ls -la bundle.tar.gz
+          file bundle.tar.gz
+
+      - name: Extract bundle
+        run: |
+          set -euo pipefail
+          tar -xzf bundle.tar.gz
+          ls -la
+          # Bundle root dir name embeds version + institution + target.
+          BUNDLE_DIR=$(find . -maxdepth 1 -type d -name 'addoce-node-v*' | head -1)
+          echo "BUNDLE_DIR=$BUNDLE_DIR" >> "$GITHUB_ENV"
+          ls -la "$BUNDLE_DIR"
+
+      - name: Install minisign (manifest signature verification)
+        run: |
+          brew install minisign
+          minisign -v
+
+      - name: Run install-darwin.sh as root
+        run: |
+          set -euo pipefail
+          cd "$BUNDLE_DIR"
+          sudo ./install.sh 2>&1 | tee /tmp/install.log
+          echo "--- install exit: $? ---"
+
+      - name: Verify install layout
+        run: |
+          set -euo pipefail
+          test -x /usr/local/opt/addoce/bin/addoce-node
+          test -f /usr/local/opt/addoce/config/config.json
+          test -f /usr/local/opt/addoce/keys/node.key
+          test -f /usr/local/opt/addoce/keys/node.pub
+          test -f /usr/local/opt/addoce/certs/client.crt
+          test -f /usr/local/opt/addoce/certs/client.key
+          test -f /usr/local/opt/addoce/certs/ca.crt
+          test -f /Library/LaunchDaemons/com.addoce.node.plist
+          /usr/local/opt/addoce/bin/addoce-node --version
+
+      - name: Stop the launchd service before manual run
+        run: |
+          # The installer started the node under launchd; stop it so we
+          # control the run + capture log lines, and so port 8080 isn't
+          # already bound when we re-launch with our own MONITORING URL.
+          sudo launchctl bootout system/com.addoce.node || true
+          sleep 2
+          sudo lsof -nP -iTCP:8080 -sTCP:LISTEN || echo "port 8080 free"
+
+      - name: Run addoce-node in background with MONITORING_INGEST_URL
+        env:
+          TUNNEL_URL: ${{ inputs.tunnel_url }}
+        run: |
+          set -euo pipefail
+          export CONFIG_FILE=/usr/local/opt/addoce/config/config.json
+          export NODE_KEY_FILE=/usr/local/opt/addoce/keys/node.key
+          export MTLS_CERT_FILE=/usr/local/opt/addoce/certs/client.crt
+          export MTLS_KEY_FILE=/usr/local/opt/addoce/certs/client.key
+          export MTLS_CA_FILE=/usr/local/opt/addoce/certs/ca.crt
+          export DATA_DIR=/usr/local/opt/addoce/data
+          export MONITORING_INGEST_URL="$TUNNEL_URL/api/v1/error-reports/"
+          export NODE_ID=tier-b-macos-runner
+          # Run as root so it can read the 0600-mode key files. Fully
+          # detach via nohup + &.
+          sudo -E nohup /usr/local/opt/addoce/bin/addoce-node > /tmp/addoce-run.log 2>&1 &
+          echo "$!" > /tmp/addoce.pid
+          # Give it ~10s to bring up REST listener.
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS -o /dev/null http://127.0.0.1:8080/api/v1/peers 2>/dev/null; then
+              echo "addoce-node REST is up"
+              break
+            fi
+            sleep 1
+          done
+          echo "--- log tail ---"
+          tail -40 /tmp/addoce-run.log
+
+      - name: Trigger storage 503
+        run: |
+          set -euo pipefail
+          TS=$(date -u +%FT%T.%3NZ)
+          echo "trigger time UTC: $TS"
+          # Expect HTTP 503 from the storage status endpoint because the
+          # bundle's config.json does not set STORAGE_API_KEY.
+          STATUS=$(curl -sS -o /tmp/status.json -w "%{http_code}" http://127.0.0.1:8080/api/v1/storage/status || true)
+          echo "HTTP=$STATUS"
+          cat /tmp/status.json
+          test "$STATUS" = "503"
+
+      - name: Assert storage 503 log line + monitoring forward
+        run: |
+          set -euo pipefail
+          # Give the in-process MONITORING reporter a few seconds to flush.
+          sleep 5
+          echo "--- log tail ---"
+          tail -60 /tmp/addoce-run.log
+          echo "--- assertions ---"
+          grep -F "[PRIVATE-NODE:storage] error: 503 auth — storage API key not configured" /tmp/addoce-run.log
+          grep -F "[MONITORING] log hook installed" /tmp/addoce-run.log
+
+      - name: Capture artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-b-macos-logs
+          path: |
+            /tmp/install.log
+            /tmp/addoce-run.log
+            /tmp/status.json
+          if-no-files-found: warn
+
+      - name: Stop addoce-node
+        if: always()
+        run: |
+          if [ -f /tmp/addoce.pid ]; then
+            sudo kill "$(cat /tmp/addoce.pid)" 2>/dev/null || true
+          fi
+          sudo pkill -f /usr/local/opt/addoce/bin/addoce-node 2>/dev/null || true
